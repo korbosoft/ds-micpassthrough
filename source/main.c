@@ -1,67 +1,100 @@
-#include <nds.h>
+// SPDX-License-Identifier: CC0-1.0
+//
+// SPDX-FileContributor: Antonio Niño Díaz, 2024
+
 #include <stdio.h>
 
-//the record sample rate
-#define sample_rate 8000
+#include <nds.h>
 
-//buffer which is written to by the arm7
-u16* mic_buffer = 0;
+// The sample rate used for the recording (samples per second)
+#define SAMPLE_RATE  8000
 
-//the length of the current data
-u32 data_length = 0;
+// Size of the buffer used to store the full recording. If you want to record N
+// seconds of audio, you need:
+//
+//     Samples per second * size of a sample * number of seconds
+//
+// The size of a sample can be either 8 bits or 16 bits depending on the
+// arguments passed to soundMicRecord().
+#define SOUND_BUFFER_SIZE (SAMPLE_RATE)
 
-// second long buffer
-u32 mic_buffer_size = sample_rate * 2 ;
+uint16_t temporary_buffer[SOUND_BUFFER_SIZE];
 
+// This flag controls whether the callback will copy data to the recording
+// buffer or if it will just ignore them (they will still be displayed on the
+// top screen!).
+bool mute = false;
 
-//mic stream handler
-void micHandler(void *data, int length)
+int main(int argc, char *argv[])
 {
+	// Setup the top screen to display the waveform as a bitmap
+	videoSetMode(MODE_5_2D);
+	vramSetBankA(VRAM_A_MAIN_BG_0x06000000);
+	int bg = bgInit(2, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
+
+	consoleDemoInit();
+
 	soundEnable();
-	soundPlaySample(data, SoundFormat_16Bit, length, sample_rate, 127, 64, false, 0);
-}
 
-int main(void)
-{
-	bool mute = false;
+	// We need to ensure that the temporary buffer isn't cached so that the ARM7
+	// can use it without issues. We also need to flush the recording and
+	// playback buffers so that we can use DMA between them. We also need to
+	// flush the playback buffer so that the audio hardware can see the
+	// up-to-date values of the buffer always.
+	DC_FlushAll();
 
-	const PrintConsole *console = consoleGetDefault();
+	// The microphone (especially on the DS) requires about a second to get its
+	// input levels to a valid baseline. Normally you could just discard the
+	// first half second, but in this example we enable it at the beginning of
+	// main() so that we can always draw the waveform.
+	soundMicRecord(temporary_buffer, sizeof(temporary_buffer),
+				   MicFormat_12Bit, SAMPLE_RATE, NULL);
 
-	mic_buffer = (u16*)malloc(mic_buffer_size);
-
-	videoSetModeSub(MODE_0_2D);
-	vramSetBankC(VRAM_C_SUB_BG);
-
-	consoleInit(NULL, console->bgLayer, BgType_Text4bpp, BgSize_T_256x256, console->mapBase, console->gfxBase, false, true);
-
-	while (pmMainLoop())
+	while (1)
 	{
+		swiWaitForVBlank();
+
+		// Draw waveform on the main screen. We need to read the buffer from an
+		// uncached mirror so that we don't load the buffer to the data cache.
+		// We need the buffer to not be cached so that the ARM7 can use it
+		// normally (the ARM7 can't see the ARM9 cache).
+		s16 *wave_buf = memUncached(temporary_buffer);
+
+		// Clear background
+		uint16_t *bg_buf = bgGetGfxPtr(bg);
+		memset(bg_buf, 0, 256 * 192 * 2);
+
+		// Divide the buffer into 256 steps (but there are two channels, so
+		// consider that too).
+		int step = (SOUND_BUFFER_SIZE) / 256;
+		for (int i = 0; i < 256; i ++)
+		{
+			// Convert from signed 16 bits to 0-191
+			s32 val = wave_buf[i * step];
+			int y = ((0x8000 + val) * 192) >> 16;
+			bg_buf[y * 256 + i] = RGB15(31, 0, 31) | BIT(15);
+		}
+
 		consoleClear();
-		iprintf("\x1b[2J"
+
+		printf("\x1b[2J"
 			"DS Microphone Passthrough\n"
 			"by Korbosoft\n"
 			"\n"
 			"Plug your DS into your\n"
 			"device's microphone jack!\n"
-			"\n");
-		scanKeys();
-		if (!mute) {
-			iprintf("Press A to mute.\n");
-			soundMicRecord(mic_buffer, mic_buffer_size, MicFormat_12Bit, sample_rate, micHandler);
-		} else {
-			memset(mic_buffer, 0, mic_buffer_size);
-			iprintf("Press A to unmute.\n");
-		}
-		if (keysDown() & KEY_START) break;
-		if (keysDown() & KEY_A)
-			mute = !mute;
+			"\n"
+		);
 
-		iprintf("\n"
-		"Press START to exit.\n");
-		swiWaitForVBlank();
+		scanKeys();
+		uint16_t keys_down = keysDown();
+
+		soundPlaySample(wave_buf, SoundFormat_16Bit, SOUND_BUFFER_SIZE*2, SAMPLE_RATE, 127, 64, false, 0);
+
+		if (keys_down & KEY_START)
+			break;
 	}
 
-	free(mic_buffer);
-
-	return 0;
+	// Turn off the microphone when you're done.
+	soundMicOff();
 }
